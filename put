@@ -2,15 +2,22 @@
 
 set -euf -o pipefail
 
+# input validation
+
 if [[ $# -ne 1 ]]; then
-  echo "usage: $0 file-to-upload"
+  echo "usage: $0 file-to-upload" 1>&2
+  exit 1
+fi
+
+inpath="$1"
+filename=`basename "$inpath"`
+
+if [ ! -f "$inpath" ]; then
+  echo "$inpath: No such file or not a file" 1>&2
   exit 1
 fi
 
 # configuration
-inpath="$1"
-filename=`basename "$inpath"`
-
 user="kevin"
 remote="files.kevinchen.co"
 webroot="/var/www/files.kevinchen.co/public_html/temp"
@@ -27,9 +34,10 @@ remote_filepath="$remote_dirpath/$filename"
 url="$baseurl/$uuid/$filename"
 
 # upload the file
-sftp "$user"@"$remote" <<EOF
+sftp "$user"@"$remote" 1>&2 <<EOF
 mkdir "$remote_dirpath"
 put "$inpath" "$remote_filepath"
+chmod 644 "$remote_filepath"
 EOF
 
 # output the result
