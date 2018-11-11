@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+#
+# Script for uploading files to a remote server for sharing.
+#
+# Few assumptions are made about the server. It only needs to provide SSH and
+# SFTP for uploading files, and a web server for sharing download links. (For
+# security, web server directory listings MUST be disabled.)
+
+import argparse
+import datetime
+import dateutil.parser
+import os
+import re
+import secrets
+import subprocess
+
+EXPIRES_FILENAME = "expires.txt"
+
+
+def main():
+    global args
+    args = make_parser().parse_args()
+    assert args.subcommand is not None  # Must provide subcommand.
+
+    # Run the selected subcommand.
+    args.func()
+
+    if args.verbose:
+        print("Success!")
+
+
+def make_parser():
+    parser = argparse.ArgumentParser(
+        description="File sharing on the private cloud.")
+    parser.add_argument(
+        "-v", "--verbose", help="Print every action.", action="store_true")
+    parser.add_argument(
+        "-n",
+        "--dry-run",
+        help="Print the actions that would have been performed.",
+        action="store_true")
+    subparsers = parser.add_subparsers(
+        dest="subcommand", help="The sub-command to run.")
+
+    # Parser for the "put" subcommand.
+    parser_put = subparsers.add_parser(
+        "put", help="Upload files to a remote server for sharing.")
+    parser_put.set_defaults(func=put_main)
+    parser_put.add_argument(
+        "files",
+        help="The file(s) to upload.",
+        type=argparse.FileType("r"),
+        nargs="+")
+    parser_put.add_argument(
+        "--no-copy",
+        help="Copy the resulting URL to clipboard",
+        action="store_true")
+    parser_put.add_argument(
+        "-e",
+        "--expires",
+        help="Number of days for expiration.",
+        type=int,
+        default=30)
+    parser_put.add_argument(
+        "--ssh-remote",
+        help="The SSH user@server to use for storing files.",
+        default="kevin@files.kevinchen.co")
+    parser_put.add_argument(
+        "--remote-path",
+        help="The directory on the server for storing files.",
+        default="/var/www/files.kevinchen.co/public_html/temp/")
+    parser_put.add_argument(
+        "--public-url",
+        help="The publicly accessible URL corresponding to --remote-path.",
+        default="https://files.kevinchen.co/temp")
+
+    # Parser for the "prune" subcommand.
+    parser_prune = subparsers.add_parser(
+        "prune", help="Remove expired uploaded files.")
+    parser_prune.set_defaults(func=prune_main)
+    parser_prune.add_argument(
+        "prune_path", metavar="path", help="The local directory to clean up.")
+
+    return parser
+
+
+def cmd(*cmd_list):
+    if args.verbose:
+        print("CMD: {}".format(" ".join(cmd_list)))
+    if not args.dry_run:
+        subprocess.check_call(cmd_list)
+
+
+# Code from the pyperclip project to avoid introducing dependency.
+# https://github.com/asweigart/pyperclip
+def copy_to_clipboard(text):
+    text = str(text)
+    p = subprocess.Popen(["pbcopy", "w"],
+                         stdin=subprocess.PIPE,
+                         close_fds=True)
+    p.communicate(input=text.encode("utf-8"))
+
+
+# Adapted from the Django project:
+# https://github.com/django/django/blob/master/django/utils/text.py
+def get_valid_filename(s):
+    """
+    Return the given string converted to a string that can be used for a clean
+    filename. Remove leading and trailing spaces; convert other spaces to
+    underscores; and remove anything that is not an alphanumeric, dash,
+    underscore, or dot.
+    >>> get_valid_filename("john's portrait in 2004.jpg")
+    'johns_portrait_in_2004.jpg'
+    """
+    s = str(s).strip().replace(" ", "_")
+    return re.sub(r"(?u)[^-\w.]", "", s)
+
+
+def put_main():
+    # Open a persistent SSH connection to be used for all operations.
+    # https://unix.stackexchange.com/a/50515/79873
+    # I prefer to use the normal ssh and rsync binaries rather than libssh2.
+    # OpenSSH probably receives more attention than libssh2, and it definitely
+    # receives more attention than no-name libssh2 Python wrapper libraries.
+    control = os.path.join(os.getenv("HOME"), ".ssh", "control:%L-%r@%h:%p")
+    control = "ControlPath=\"{}\"".format(control)
+    cmd("ssh", "-nNf", "-o", "ControlMaster=auto", "-o", control,
+        args.ssh_remote)
+
+    # Compute the expiration.
+    expires = datetime.datetime.utcnow() + datetime.timedelta(
+        days=args.expires)
+    expires_str = expires.isoformat(timespec="seconds")
+    if args.verbose:
+        print("INFO: Files expire in {} days, on {}".format(
+            args.expires, expires.astimezone()))
+
+    urls = []
+    for f in args.files:
+        url = put_single(f.name, control, expires_str)
+        urls.append(url)
+
+    urls = "\n".join(urls)
+    print(urls)
+    if not args.no_copy:
+        copy_to_clipboard(urls)
+
+    # Close SSH connection.
+    cmd("ssh", "-q", "-O", "exit", "-o", control, args.ssh_remote)
+
+
+def put_single(local_path, ssh_control, expires):
+    # Generate hard-to-guess token for URL.
+    identifier = secrets.token_urlsafe()
+
+    filename = os.path.basename(local_path)
+    remote_filename = get_valid_filename(filename)
+
+    remote_dir = os.path.join(args.remote_path, identifier)
+    remote_file = os.path.join(remote_dir, remote_filename)
+    remote_expires = os.path.join(remote_dir, EXPIRES_FILENAME)
+
+    if args.verbose or args.dry_run:
+        print("INFO: Uploading {} -> {}".format(local_path, remote_file))
+
+    # Utility to run the given command on the remote server. This doesn't have
+    # the overhead of a normal ssh command because we reuse the connection.
+    def ssh(*cmd_list):
+        cmd_list = ("ssh", "-o", ssh_control, args.ssh_remote) + cmd_list
+        cmd(*cmd_list)
+
+    # Create the directory to hold the file and expiration date.
+    ssh("mkdir {}".format(remote_dir))
+    # Upload expiration first in case file transfer fails.
+    ssh("echo '{}' > {}".format(expires, remote_expires))
+    # Upload the file.
+    cmd("scp", "-p", "-o", ssh_control, local_path, "{}:{}".format(
+        args.ssh_remote, remote_file))
+    # Ensure the file is accessible to the web server.
+    ssh("chmod 644 {}".format(remote_file))
+
+    public_url = "{}/{}/{}".format(args.public_url, identifier,
+                                   remote_filename)
+    return public_url
+
+
+def prune_main():
+    now = datetime.datetime.utcnow()
+    if args.verbose:
+        print("INFO: current date utc {}".format(now))
+    # Currently, deletion must visit every directory to check whether the file
+    # has expired. If we want to require the server to have database software,
+    # we could first query the database for this information. This Unix-y
+    # solution works for now.
+    for identifier in os.listdir(args.prune_path):
+        # Get the expiration date.
+        expires_path = os.path.join(args.prune_path, identifier,
+                                    EXPIRES_FILENAME)
+        if not os.path.exists(expires_path):
+            continue  # Legacy file with no expiration.
+        with open(expires_path, "r") as expires_file:
+            date = dateutil.parser.parse(expires_file.read())
+
+        # Delete bundle if needed.
+        if date < now:
+            if args.verbose or args.dry_run:
+                print(
+                    "INFO: Removing bundle \"{}\" (expired {}, {} ago)".format(
+                        identifier, date, now - date))
+            remove_bundle(identifier)
+
+
+def remove_bundle(identifier):
+    # The directory to be deleted.
+    path = os.path.join(args.prune_path, identifier)
+    # In case there is a bug in the path finding code, this might catch it.
+    assert os.path.exists(os.path.join(path, EXPIRES_FILENAME))
+
+    # Remove given directory recursively. (From Python documentation.)
+    for root, dirs, files in os.walk(path, topdown=False):
+        for name in files:
+            if args.verbose or args.dry_run:
+                print("INFO: Remove {}".format(name))
+            if not args.dry_run:
+                os.remove(os.path.join(root, name))
+
+        for name in dirs:
+            if args.verbose or args.dry_run:
+                print("INFO: Remove {}".format(name))
+            if not args.dry_run:
+                os.rmdir(os.path.join(root, name))
+
+    if args.verbose or args.dry_run:
+        print("INFO: Remove {}".format(path))
+    if not args.dry_run:
+        os.rmdir(path)
+
+
+if __name__ == "__main__":
+    main()
