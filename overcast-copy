@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""
+Downloads media files using youtube-dl and uploads them to Overcast private
+storage.
+
+Before using this script, log into <https://overcast.fm/> in your browser and
+extract the cookie to a configuration file.
+
+Sample config:
+
+{
+    "overcast_cookie": {
+        "o": "paste-your-cookie-here"
+    }
+}
+
+This script needs to scrape the Overcast website because of how file uploads are
+designed.
+
+Overcast's uploads page sends file POST requests directly to its private Amazon
+S3 bucket. To authenticate file uploads, the Overcast backend generates an AWS
+Signature using its AWS API secret. The signature is embedded into the uploads
+page for logged in users along with other request params that must be presented
+to Amazon S3 for the upload to work.
+
+The Overcast backend sets a four-hour expiration when generating signatures, so
+we scrape a fresh signature each time.
+
+More info about Amazon S3 and HTML forms:
+<https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTForms.html>.
+"""
+
+import argparse
+import json
+import os
+import re
+import tempfile
+
+import bs4
+import requests
+
+import youtube_dl
+
+_AUDIO_CODEC = "mp3"
+
+_YOUTUBE_DL_OPTIONS = {
+    "format": "bestaudio/best",
+    "postprocessors": [{
+        "key": "FFmpegExtractAudio",
+        "preferredcodec": _AUDIO_CODEC,
+        "preferredquality": "192",
+    }],
+    "outtmpl": "%(id)s.%(ext)s",
+}
+
+_OVERCAST_BUCKET = "uploads-overcast"
+
+
+# Adapted from the Django project:
+# https://github.com/django/django/blob/master/django/utils/text.py
+def _get_valid_filename(s):
+    """
+    Return the given string converted to a string that can be used for a clean
+    filename. Remove leading and trailing spaces; convert other spaces to
+    underscores; and remove anything that is not an alphanumeric, dash,
+    underscore, or dot.
+    >>> get_valid_filename("john's portrait in 2004.jpg")
+    'johns_portrait_in_2004.jpg'
+    """
+    s = str(s).strip()
+    s = re.sub(r"(?u)\s+", " ", s)
+    s = re.sub(r"(?u)[^-_\w. ]", "", s)
+    return s
+
+
+def download_media(media_url, destination_dir):
+    options = _YOUTUBE_DL_OPTIONS.copy()
+    options["outtmpl"] = os.path.join(destination_dir, options["outtmpl"])
+
+    with youtube_dl.YoutubeDL(options) as ydl:
+        # extract_info is somewhat of a misnomer, as it also contains download
+        # logic.
+        result = ydl.extract_info(media_url, download=True)
+
+        filename = os.path.join(destination_dir,
+                                "{}.{}".format(result["id"], _AUDIO_CODEC))
+        title = result["title"]
+
+        return filename, title
+
+
+def _overcast_get_upload_info(overcast_cookie):
+    """
+    Scrape the info needed to upload the file to S3 bucket.
+    """
+
+    response = requests.get("https://overcast.fm/uploads",
+                            cookies=overcast_cookie)
+    response.raise_for_status()
+
+    soup = bs4.BeautifulSoup(response.content, "html.parser")
+    form = soup.find_all(id="upload_form")
+    assert len(form) == 1
+    form = form[0]
+
+    return {
+        "action": form.get("action"),
+        "key_prefix": form.get("data-key-prefix"),
+        "form_inputs": {
+            elem.get("name"): elem.get("value")
+            for elem in form.find_all("input")
+        },
+    }
+
+
+def overcast_upload(filename, title, overcast_cookie):
+    upload_params = _overcast_get_upload_info(overcast_cookie)
+
+    key = upload_params["key_prefix"] + title
+
+    form = upload_params["form_inputs"]
+    form["key"] = key
+
+    # Upload the file to Overcast's S3 bucket.
+    with open(filename, "rb") as f:
+        files = {"file": (title, f, "audio/mpeg", {"Expires": "0"})}
+
+        upload_response = requests.post(upload_params["action"],
+                                        data=form,
+                                        files=files)
+    upload_response.raise_for_status()
+
+    # Let the Overcast app know to process the new file.
+    completion_response = requests.post(
+        "https://overcast.fm/podcasts/upload_succeeded",
+        cookies=overcast_cookie,
+        data={"key": key})
+    completion_response.raise_for_status()
+
+
+def copy_to_overcast(media_url, overcast_cookie):
+    temp_dir = tempfile.mkdtemp()
+
+    filename, title = download_media(media_url, temp_dir)
+    title = _get_valid_filename(title)
+    print("Uploading as \"{}\"".format(title))
+    title = "{}.{}".format(title, _AUDIO_CODEC)
+
+    overcast_upload(filename, title, overcast_cookie)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Copy media files to Overcast private storage.")
+    parser.add_argument("media_url",
+                        type=str,
+                        help="URL of the media to download.")
+    parser.add_argument("--config_file",
+                        type=str,
+                        default=os.path.expanduser(
+                            "~/.config/kevinchen-scripts/overcast-copy.json"),
+                        required=False,
+                        help="Path to config file with user ID and AWS key")
+    args = parser.parse_args()
+
+    with open(args.config_file, "r") as f:
+        config = json.load(f)
+
+    copy_to_overcast(args.media_url, config["overcast_cookie"])
+
+
+if __name__ == "__main__":
+    main()
